@@ -1,5 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
-
 import gc
 import time
 import uuid
@@ -8,7 +6,6 @@ from typing import Optional
 import torch
 
 from sam3.logger import get_logger
-
 
 logger = get_logger(__name__)
 
@@ -44,7 +41,6 @@ class Sam3StreamPredictor:
         device: Optional[str] = None,
         compile: bool = False,
     ) -> None:
-
         from sam3.model_builder import build_sam3_stream_model
 
         if device is None:
@@ -121,7 +117,9 @@ class Sam3StreamPredictor:
     def add_frame(self, session_id: str, frame):
         session = self._get_session(session_id)
         inference_state = session["state"]
-        frame_idx = self.model.add_frame(inference_state=inference_state, raw_image=frame)
+        frame_idx = self.model.add_frame(
+            inference_state=inference_state, raw_image=frame
+        )
         logger.debug(f"added frame -> session={session_id}, frame_index={frame_idx}")
         return {"frame_index": frame_idx}
 
@@ -155,7 +153,12 @@ class Sam3StreamPredictor:
         outputs = self.model.run_single_frame_inference(
             inference_state=inference_state, frame_idx=frame_idx
         )
-        return {"frame_index": inference_state["curr_frame_idx"] if frame_idx is None else frame_idx, "outputs": outputs}
+        return {
+            "frame_index": inference_state["curr_frame_idx"]
+            if frame_idx is None
+            else frame_idx,
+            "outputs": outputs,
+        }
 
     def get_cached_output(self, session_id: str, frame_idx: int):
         session = self._get_session(session_id)
@@ -189,7 +192,9 @@ class Sam3StreamPredictor:
     def _get_session(self, session_id: str):
         session = self._ALL_INFERENCE_STATES.get(session_id, None)
         if session is None:
-            raise RuntimeError(f"Cannot find session {session_id}; it might have expired")
+            raise RuntimeError(
+                f"Cannot find session {session_id}; it might have expired"
+            )
         return session
 
     def _get_session_stats(self):
