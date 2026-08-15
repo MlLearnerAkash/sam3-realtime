@@ -1,19 +1,29 @@
 import argparse
 import os
+import sys
 import time
 from datetime import datetime
 
 import cv2
+import numpy as np
 import torch
 from PIL import Image
 from saving_utils import save_video
 from stream_handler import FrameStatus, InputStreamHandler
 
+
+
 from sam3.model_builder import build_sam3_stream_predictor
 from sam3.visualization_utils import render_masklet_frame
 
+sys.path.insert(0, "/home/opervu/ws/make_hdr")
+from hdr import merge_hdr  # noqa: E402
+from frame_capture import capture_hdr_sets
+import time
+from arena_api.system import system # noqa: E402
+
 YARP_IMAGE_PORT = "/sam3/rgbImage:i"
-DEFAULT_TEXT_PROMPT = ["sponge", "hand"]
+DEFAULT_TEXT_PROMPT = ["sponge", "forceps"]
 
 
 def is_inside_region(cx, cy, region):
@@ -37,7 +47,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--custom_det_chkpt",
         type= str,
-        default="/data/dataset/sam3_train/coco_format/checkpoints/checkpoint.pt",
+        default="chkpt/checkpoint.pt",
     )
     parser.add_argument(
         "--output_root_dir",
@@ -57,9 +67,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stream_type",
         type=str,
-        choices=["yarp", "video", "webcam"],
+        choices=["yarp", "video", "webcam", "hdr"],
         default="yarp",
-        help="Input source kind: yarp | video | webcam",
+        help="Input source kind: yarp | video | webcam | hdr (Arena HDR camera)",
     )
     parser.add_argument(
         "--video_path",
@@ -227,14 +237,51 @@ if __name__ == "__main__":
     session_id = resp["session_id"]
 
     # Initialize input source
-    src = InputStreamHandler(
-        kind=args.stream_type,
-        video_path=args.video_path,
-        webcam_index=args.webcam_index,
-        yarp_port_name=args.yarp_port,
-    )
-    print(f"Opening source: {args.stream_type}")
-    src.open()
+    if args.stream_type == "hdr":
+        # Arena HDR: connect to the LUCID camera and build an endless
+        # generator of exposure-bracketed cycles. Each cycle holds
+        # `num_exposures` frames, longest exposure first.
+        tries = 0
+        tries_max = 6
+        sleep_time_secs = 10
+        devices = None
+        while tries < tries_max:
+            devices = system.create_device()
+            if not devices:
+                print(f'Try {tries + 1} of {tries_max}: waiting '
+                      f'{sleep_time_secs} secs for a device to be connected!')
+                time.sleep(sleep_time_secs)
+                tries += 1
+            else:
+                break
+        else:
+            raise Exception('No device found! Please connect a device and run '
+                            'the example again.')
+
+        device = system.select_device(devices)
+        print(f'Device used: {device}')
+
+        # 4 exposures halving down from 100 ms: 100000, 50000, 25000, 12500 us
+        num_exposures = 4
+        exposure_time_max = 100000.0
+        hdr_sets = capture_hdr_sets(device, num_exposures=num_exposures,
+                                    exposure_time_max=exposure_time_max,
+                                    num_cycles=-1, frame_rate=1.0)
+        # Longest first: [100000, 50000, 25000, 12500]
+        hdr_exposure_times = np.array(
+            [exposure_time_max / (2 ** i) for i in range(num_exposures)],
+            dtype=np.float32,
+        )
+        src = None
+    else:
+        src = InputStreamHandler(
+            kind=args.stream_type,
+            video_path=args.video_path,
+            webcam_index=args.webcam_index,
+            yarp_port_name=args.yarp_port,
+        )
+        print(f"Opening source: {args.stream_type}")
+        src.open()
 
     peak_memory = 0
     frame_idx = 0
@@ -246,15 +293,31 @@ if __name__ == "__main__":
     try:
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             while stop_processing is not True:
-                # Read frame (RGB)
-                stream_buffer = src.read()
-                if stream_buffer.status == FrameStatus.NO_FRAME:
-                    # YARP: no new frame yet; try again.
-                    continue
-                if stream_buffer.status == FrameStatus.EOS:
-                    # End of stream for video/webcam or closed YARP port.
-                    break
-                frame_rgb = stream_buffer.frame
+                if args.stream_type == "hdr":
+                    # Next exposure cycle: merge the shortest (dark) and
+                    # longest (bright) exposure into one HDR frame (RGB).
+                    try:
+                        cycle = next(hdr_sets)
+                    except StopIteration:
+                        print("\nHDR capture ended.")
+                        break
+                    sorted_frames = sorted(cycle, key=lambda img: img.mean())
+                    dark_frame = sorted_frames[0]     # shortest exposure
+                    bright_frame = sorted_frames[-1]  # longest exposure
+                    # Exposure times in the same order as [dark, bright].
+                    exposure_times = hdr_exposure_times[[-1, 0]]
+                    frame_rgb = merge_hdr([dark_frame, bright_frame],
+                                          exposure_times)
+                else:
+                    # Read frame (RGB)
+                    stream_buffer = src.read()
+                    if stream_buffer.status == FrameStatus.NO_FRAME:
+                        # YARP: no new frame yet; try again.
+                        continue
+                    if stream_buffer.status == FrameStatus.EOS:
+                        # End of stream for video/webcam or closed YARP port.
+                        break
+                    frame_rgb = stream_buffer.frame
 
                 # Push frame
                 predictor.handle_request(
@@ -364,7 +427,17 @@ if __name__ == "__main__":
 
     finally:
         # Source cleanup
-        src.close()
+        if args.stream_type == "hdr":
+            # Closing the generator restores the camera's sequencer/exposure
+            # settings; the device must still be destroyed to avoid
+            # corrupting the camera's saved preset.
+            try:
+                hdr_sets.close()
+            except Exception:
+                pass
+            system.destroy_device()
+        else:
+            src.close()
 
         if args.save_video:
             if len(frame_timestamps) >= 2:
