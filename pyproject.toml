@@ -24,7 +24,26 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = [
+    "timm>=1.0.17",
+    "numpy>=1.26",
+    "tqdm",
+    "ftfy>=6.1.1",
+    "regex",
+    "iopath>=0.1.10",
+    "typing-extensions",
+    "huggingface-hub",
+    "einops>=0.8.0",
+    "torch",
+    "pycocotools",
+    "psutil",
+    "av",
+    "yarp",
+    "opencv-python",
+    "pandas>=2.3.3,<3",
+    "scikit-image>=0.25.2,<0.26",
+    "scikit-learn>=1.7.2,<2",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/facebookresearch/sam3"

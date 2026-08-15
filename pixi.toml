@@ -2,11 +2,8 @@
 authors = ["Matteo Tafuro <tafuromatteo00@gmail.com>"]
 channels = ["conda-forge"]
 name = "sam3-realtime"
-platforms = ["linux-64"]
+platforms = [{ platform = "linux-64", cuda = "12.0" }]
 version = "0.1.0"
-
-[system-requirements]
-cuda = "12.0"
 
 [dependencies]
 python = ">=3.10"
@@ -33,5 +30,6 @@ scikit-learn = ">=1.7.2,<2"
 # editable install of SAM3 fork (in this repo root)
 [pypi-dependencies]
 sam3 = { path = ".", editable = true }
+arena-api = { path = "/home/opervu/Downloads/ArenaSDK_AVMP_v_1.0.8.60_Linux_x64/ArenaSDK_Linux_x64/OutputDirectory/Linux/x64Release/ArenaPy/arena_api-2.9.5-py3-none-any.whl" }
 
 [tasks]
