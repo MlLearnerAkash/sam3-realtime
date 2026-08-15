@@ -2,7 +2,7 @@
 
 import logging
 from collections import defaultdict
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,6 +31,9 @@ class Sam3StreamInference(Sam3VideoBase):
     any offline propagation assumptions.
     """
 
+    # TEXT_ID_FOR_TEXT and TEXT_ID_FOR_VISUAL are no longer used as fixed
+    # constants when multi-text is active. They are kept for backward compat
+    # but are deprecated. Use the dynamic indexing in add_prompt/add_frame instead.
     TEXT_ID_FOR_TEXT = 0
     TEXT_ID_FOR_VISUAL = 1
 
@@ -42,6 +45,11 @@ class Sam3StreamInference(Sam3VideoBase):
         compile_model: bool = False,
         # memory bounding knobs (CPU ingress + bounded caches like offline)
         max_cached_frames: int = 128,
+        # whether to offload inference state tensors to CPU to reduce GPU VRAM usage
+        # (at the cost of slightly lower throughput)
+        offload_state_to_cpu: bool = True,
+        # whether to load frames asynchronously to reduce IO overhead
+        async_loading_frames: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -50,6 +58,8 @@ class Sam3StreamInference(Sam3VideoBase):
         self.image_std = image_std
         self.compile_model = compile_model
         self.max_cached_frames = max_cached_frames
+        self.offload_state_to_cpu = offload_state_to_cpu
+        self.async_loading_frames = async_loading_frames
 
     @torch.inference_mode()
     def init_stream_state(self) -> Dict[str, Any]:
@@ -60,6 +70,13 @@ class Sam3StreamInference(Sam3VideoBase):
             "orig_height": None,
             "orig_width": None,
             "curr_frame_idx": -1,
+            # whether to offload the inference state to CPU memory
+            # turning on this option saves GPU VRAM at the cost of slightly lower throughput
+            "offload_state_to_cpu": self.offload_state_to_cpu,
+            # whether to load frames asynchronously to reduce IO overhead
+            "async_loading_frames": self.async_loading_frames,
+            # storage device for cached outputs (CPU if offload_state_to_cpu else GPU)
+            "storage_device": torch.device("cpu") if self.offload_state_to_cpu else device,
             "constants": {
                 "empty_geometric_prompt": Prompt(
                     box_embeddings=torch.zeros(0, bs, 4, device=device),
@@ -77,7 +94,7 @@ class Sam3StreamInference(Sam3VideoBase):
             "per_frame_visual_prompt": [],
             "per_frame_geometric_prompt": [],
             "per_frame_cur_step": [],
-            "text_prompt": None,
+            "text_prompts": None,
             "tracker_inference_states": [],
             "tracker_metadata": {},
             "feature_cache": {},
@@ -91,8 +108,14 @@ class Sam3StreamInference(Sam3VideoBase):
     @torch.inference_mode()
     def reset_stream(self, inference_state: Dict[str, Any]) -> None:
         """Revert `inference_state` to what it was right after initialization."""
-        inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
-        inference_state["text_prompt"] = None
+        text_prompts = inference_state.get("text_prompts")
+        if text_prompts and isinstance(text_prompts, list):
+            # Multi-text: reset all text slots
+            for i in range(len(text_prompts)):
+                inference_state["input_batch"].find_text_batch[i] = text_prompts[i]
+        else:
+            inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
+        inference_state["text_prompts"] = None
         for t in range(inference_state["num_frames"]):
             inference_state["input_batch"].find_inputs[t].text_ids[...] = 0
             # constructing an output list in inference state (we start with an empty list)
@@ -152,12 +175,14 @@ class Sam3StreamInference(Sam3VideoBase):
             inference_state["orig_width"] = orig_w
 
         if inference_state["input_batch"] is None:
+            # Use single-text mode: text at index 0 if text_prompts is set, else visual at index 1
             find_text_batch = ["<text placeholder>", "visual"]
             input_box_embedding_dim = 258
             input_points_embedding_dim = 257
+            default_text_id = self.TEXT_ID_FOR_VISUAL
             stage = FindStage(
                 img_ids=[0],
-                text_ids=[self.TEXT_ID_FOR_VISUAL],
+                text_ids=[default_text_id],
                 input_boxes=[torch.zeros(input_box_embedding_dim)],
                 input_boxes_mask=[torch.empty(0, dtype=torch.bool)],
                 input_boxes_label=[torch.empty(0, dtype=torch.long)],
@@ -189,10 +214,10 @@ class Sam3StreamInference(Sam3VideoBase):
 
             input_box_embedding_dim = 258
             input_points_embedding_dim = 257
-            text_id = self.TEXT_ID_FOR_TEXT if inference_state.get("text_prompt") else self.TEXT_ID_FOR_VISUAL
+            default_text_id = self.TEXT_ID_FOR_TEXT if inference_state.get("text_prompts") else self.TEXT_ID_FOR_VISUAL
             stage = FindStage(
                 img_ids=[T_prev],
-                text_ids=[text_id],
+                text_ids=[default_text_id],
                 input_boxes=[torch.zeros(input_box_embedding_dim)],
                 input_boxes_mask=[torch.empty(0, dtype=torch.bool)],
                 input_boxes_label=[torch.empty(0, dtype=torch.long)],
@@ -261,24 +286,26 @@ class Sam3StreamInference(Sam3VideoBase):
         self,
         inference_state: Dict[str, Any],
         frame_idx: int,
-        text_str: Optional[str] = None,
+        text_str: Optional[Union[str, List[str]]] = None,
         boxes_xywh: Optional[torch.Tensor] = None,
         box_labels: Optional[torch.Tensor] = None,
     ):
         assert inference_state.get("input_batch") is not None, "No frames added yet. Call add_frame first."
         assert 0 <= frame_idx <= inference_state["curr_frame_idx"], "frame_idx must exist"
 
-        if text_str is not None and text_str != "visual":
-            inference_state["text_prompt"] = text_str
-            inference_state["input_batch"].find_text_batch[0] = text_str
-            text_id = self.TEXT_ID_FOR_TEXT
+        # Normalize text_str to a list or None
+        if text_str is None or text_str == "visual":
+            text_list = None
+        elif isinstance(text_str, str):
+            text_list = [text_str]
+        elif isinstance(text_str, list):
+            text_list = [t for t in text_str if t != "visual"]
+            if len(text_list) == 0:
+                text_list = None
         else:
-            inference_state["text_prompt"] = None
-            inference_state["input_batch"].find_text_batch[0] = "<text placeholder>"
-            text_id = self.TEXT_ID_FOR_VISUAL
-        for st in inference_state["input_batch"].find_inputs:
-            st.text_ids[...] = text_id
+            raise TypeError(f"text_str must be str, List[str], or None; got {type(text_str)}")
 
+        # --- Process geometric/box prompts (shared across all text categories) ---
         assert (boxes_xywh is not None) == (box_labels is not None)
         if boxes_xywh is not None:
             boxes_xywh = torch.as_tensor(boxes_xywh, dtype=torch.float32)
@@ -307,7 +334,80 @@ class Sam3StreamInference(Sam3VideoBase):
                 geometric_prompt_visual if geometric_prompt_visual is not None else geometric_prompt
             )
 
-        return frame_idx, self.run_single_frame_inference(inference_state, frame_idx)
+        # --- Run inference: loop over text categories (one encoder/decoder pass each) ---
+        inference_state["text_prompts"] = text_list
+
+        if text_list is not None:
+            # Multi-text or single-text: run once per category, accumulating tracker results
+            all_outputs = []
+            prev_obj_ids = set()  # track obj_ids from previous iterations for dedup
+
+            for cat_idx, category in enumerate(text_list):
+                # Temporarily set single-text mode for this category
+                inference_state["input_batch"].find_text_batch[:] = [category, "visual"]
+                for st in inference_state["input_batch"].find_inputs:
+                    st.text_ids = torch.as_tensor([self.TEXT_ID_FOR_TEXT], dtype=torch.long, device=st.text_ids.device)
+
+                output = self.run_single_frame_inference(inference_state, frame_idx)
+                if output is not None:
+                    # Filter to only new obj_ids from this category pass
+                    curr_ids = set(output.get("out_obj_ids", []))
+                    new_ids = curr_ids - prev_obj_ids
+                    if new_ids:
+                        new_indices = [i for i, oid in enumerate(output["out_obj_ids"]) if oid in new_ids]
+                        filtered = {}
+                        for key in ["out_obj_ids", "out_probs", "out_boxes_xywh", "out_binary_masks"]:
+                            if key in output:
+                                filtered[key] = output[key][new_indices]
+                        # Carry category labels through dedup
+                        if "out_obj_categories" in output:
+                            filtered["out_obj_categories"] = [output["out_obj_categories"][i] for i in new_indices]
+                        filtered["frame_stats"] = output.get("frame_stats")
+                        all_outputs.append(filtered)
+                    prev_obj_ids = curr_ids
+
+            # Leave find_text_batch in single-text mode (last category) so that
+            # subsequent run_inference calls don't crash with multi-text ids.
+            last_category = text_list[-1]
+            inference_state["input_batch"].find_text_batch[:] = [last_category, "visual"]
+            for st in inference_state["input_batch"].find_inputs:
+                st.text_ids = torch.as_tensor([self.TEXT_ID_FOR_TEXT], dtype=torch.long, device=st.text_ids.device)
+
+            # Merge outputs: combine masks/boxes/scores from all categories
+            if len(all_outputs) > 0:
+                merged = self._merge_multi_text_outputs(all_outputs)
+                return frame_idx, merged
+            return frame_idx, None
+        else:
+            # No text prompt: visual/geometric-only mode
+            inference_state["input_batch"].find_text_batch[:] = ["<text placeholder>", "visual"]
+            for st in inference_state["input_batch"].find_inputs:
+                st.text_ids = torch.as_tensor([self.TEXT_ID_FOR_VISUAL], dtype=torch.long, device=st.text_ids.device)
+
+            return frame_idx, self.run_single_frame_inference(inference_state, frame_idx)
+
+    @staticmethod
+    def _merge_multi_text_outputs(all_outputs: List[Dict]) -> Dict:
+        """Merge per-category outputs into one combined output dict."""
+        if len(all_outputs) == 0:
+            return None
+        if len(all_outputs) == 1:
+            return all_outputs[0]
+
+        merged = {}
+        for key in ["out_obj_ids", "out_probs", "out_boxes_xywh", "out_binary_masks"]:
+            arrays = [o[key] for o in all_outputs if o is not None and key in o and len(o[key]) > 0]
+            if arrays:
+                merged[key] = np.concatenate(arrays, axis=0)
+            else:
+                merged[key] = all_outputs[0][key][:0]  # empty array with correct dtype/shape
+
+        # Merge category labels
+        cat_arrays = [o.get("out_obj_categories", []) for o in all_outputs if o is not None]
+        merged["out_obj_categories"] = [c for cats in cat_arrays for c in cats]
+
+        merged["frame_stats"] = all_outputs[-1].get("frame_stats", None)
+        return merged
 
     @torch.inference_mode()
     def run_single_frame_inference(self, inference_state: Dict[str, Any], frame_idx: Optional[int] = None):
@@ -317,40 +417,187 @@ class Sam3StreamInference(Sam3VideoBase):
         if frame_idx is None:
             frame_idx = inference_state["curr_frame_idx"]
         input_batch = inference_state["input_batch"]
-        tracker_states_local = inference_state["tracker_inference_states"]
-        has_text_prompt = inference_state["text_prompt"] is not None
+
+        # When multiple text categories are active, run detection for ALL categories
+        # on every frame (looping within this call). This avoids ID switches caused
+        # by the tracker's hotstart logic removing masklets that weren't re-detected.
+        text_prompts = inference_state.get("text_prompts")
         has_geometric_prompt = inference_state["per_frame_geometric_prompt"][frame_idx] is not None
         num_frames_dynamic = input_batch.img_batch.shape[0] if isinstance(input_batch.img_batch, torch.Tensor) else len(input_batch.img_batch)
 
-        (
-            obj_id_to_mask,
-            obj_id_to_score,
-            tracker_states_local_new,
-            tracker_metadata_new,
-            frame_stats,
-            _,
-        ) = self._det_track_one_frame(
-            frame_idx=frame_idx,
-            num_frames=num_frames_dynamic,
-            reverse=False,
-            input_batch=input_batch,
-            geometric_prompt=(
-                inference_state["constants"]["empty_geometric_prompt"]
-                if not has_geometric_prompt
-                else inference_state["per_frame_geometric_prompt"][frame_idx]
-            ),
-            tracker_states_local=tracker_states_local,
-            tracker_metadata_prev=inference_state["tracker_metadata"],
-            feature_cache=inference_state["feature_cache"],
-            orig_vid_height=inference_state["orig_height"],
-            orig_vid_width=inference_state["orig_width"],
-            is_image_only=False,
-            allow_new_detections=has_text_prompt or has_geometric_prompt,
-        )
+        if text_prompts is not None and isinstance(text_prompts, list) and len(text_prompts) > 1:
+            # Multi-category: run detector for each category, merge det_out,
+            # then run tracker pipeline ONCE to avoid cross-category hotstart penalties.
+            all_bbox, all_mask, all_scores = [], [], []
+            det_category_map = {}  # merged det_idx -> category text
+
+            for cat_idx, category in enumerate(text_prompts):
+                feature_cache = inference_state["feature_cache"]
+                if "multigpu_buffer" in feature_cache:
+                    feature_cache["multigpu_buffer"].pop(frame_idx, None)
+                if "text" in feature_cache:
+                    feature_cache.pop("text", None)
+
+                inference_state["input_batch"].find_text_batch[:] = [category, "visual"]
+                for st in inference_state["input_batch"].find_inputs:
+                    st.text_ids = torch.as_tensor([self.TEXT_ID_FOR_TEXT], dtype=torch.long, device=st.text_ids.device)
+
+                det_out = self.run_backbone_and_detection(
+                    frame_idx=frame_idx,
+                    num_frames=num_frames_dynamic,
+                    reverse=False,
+                    input_batch=input_batch,
+                    geometric_prompt=(
+                        inference_state["constants"]["empty_geometric_prompt"]
+                        if not has_geometric_prompt
+                        else inference_state["per_frame_geometric_prompt"][frame_idx]
+                    ),
+                    feature_cache=inference_state["feature_cache"],
+                    allow_new_detections=True,
+                )
+                n_det = len(det_out["bbox"])
+                offset = sum(len(b) for b in all_bbox)
+                for i in range(n_det):
+                    det_category_map[offset + i] = category
+                all_bbox.append(det_out["bbox"])
+                all_mask.append(det_out["mask"])
+                all_scores.append(det_out["scores"])
+
+            # Merge all category detections into one det_out
+            merged_det_out = {
+                "bbox": torch.cat(all_bbox, dim=0) if all_bbox else torch.empty(0, 4, device=self.device),
+                "mask": torch.cat(all_mask, dim=0) if all_mask else torch.empty(0, 256, 256, device=self.device),
+                "scores": torch.cat(all_scores, dim=0) if all_scores else torch.empty(0, device=self.device),
+            }
+
+            # Now run the tracker pipeline once with ALL detections
+            tracker_states_local = inference_state["tracker_inference_states"]
+            tracker_metadata_prev = inference_state["tracker_metadata"]
+            if tracker_metadata_prev == {}:
+                tracker_metadata_prev.update(self._initialize_metadata())
+
+            tracker_low_res_masks_global, tracker_obj_scores_global = (
+                self.run_tracker_propagation(
+                    frame_idx=frame_idx,
+                    num_frames=num_frames_dynamic,
+                    reverse=False,
+                    tracker_states_local=tracker_states_local,
+                    tracker_metadata_prev=tracker_metadata_prev,
+                )
+            )
+
+            tracker_update_plan, tracker_metadata_new = (
+                self.run_tracker_update_planning_phase(
+                    frame_idx=frame_idx,
+                    num_frames=num_frames_dynamic,
+                    reverse=False,
+                    det_out=merged_det_out,
+                    tracker_low_res_masks_global=tracker_low_res_masks_global,
+                    tracker_obj_scores_global=tracker_obj_scores_global,
+                    tracker_metadata_prev=tracker_metadata_prev,
+                    tracker_states_local=tracker_states_local,
+                    is_image_only=False,
+                )
+            )
+
+            reconditioned_obj_ids = tracker_update_plan.get("reconditioned_obj_ids", set())
+            det_to_matched_trk_obj_ids = tracker_update_plan.get("det_to_matched_trk_obj_ids", {})
+
+            # Map new detections to categories and persist
+            new_det_fa_inds = tracker_update_plan.get("new_det_fa_inds", [])
+            new_det_obj_ids = tracker_update_plan.get("new_det_obj_ids", [])
+            if "obj_id_to_category" not in inference_state:
+                inference_state["obj_id_to_category"] = {}
+            for det_idx, obj_id in zip(new_det_fa_inds, new_det_obj_ids):
+                cat = det_category_map.get(int(det_idx))
+                if cat is not None:
+                    inference_state["obj_id_to_category"][int(obj_id)] = cat
+
+            tracker_states_local_new = self.run_tracker_update_execution_phase(
+                frame_idx=frame_idx,
+                num_frames=num_frames_dynamic,
+                reverse=False,
+                det_out=merged_det_out,
+                tracker_states_local=tracker_states_local,
+                tracker_update_plan=tracker_update_plan,
+                orig_vid_height=inference_state["orig_height"],
+                orig_vid_width=inference_state["orig_width"],
+                feature_cache=inference_state["feature_cache"],
+            )
+
+            if self.rank == 0:
+                obj_id_to_mask = self.build_outputs(
+                    frame_idx=frame_idx,
+                    num_frames=num_frames_dynamic,
+                    reverse=False,
+                    det_out=merged_det_out,
+                    tracker_low_res_masks_global=tracker_low_res_masks_global,
+                    tracker_obj_scores_global=tracker_obj_scores_global,
+                    tracker_metadata_prev=tracker_metadata_prev,
+                    tracker_update_plan=tracker_update_plan,
+                    orig_vid_height=inference_state["orig_height"],
+                    orig_vid_width=inference_state["orig_width"],
+                    reconditioned_obj_ids=reconditioned_obj_ids,
+                    det_to_matched_trk_obj_ids=det_to_matched_trk_obj_ids,
+                )
+                obj_id_to_score = tracker_metadata_new["obj_id_to_score"]
+            else:
+                obj_id_to_mask, obj_id_to_score = {}, {}
+
+            frame_stats = {
+                "num_obj_tracked": np.sum(tracker_metadata_new["num_obj_per_gpu"]),
+                "num_obj_dropped": tracker_update_plan["num_obj_dropped_due_to_limit"],
+            }
+
+            # Restore last category as single-text mode
+            last_category = text_prompts[-1]
+            inference_state["input_batch"].find_text_batch[:] = [last_category, "visual"]
+            for st in inference_state["input_batch"].find_inputs:
+                st.text_ids = torch.as_tensor([self.TEXT_ID_FOR_TEXT], dtype=torch.long, device=st.text_ids.device)
+        else:
+            tracker_states_local = inference_state["tracker_inference_states"]
+            has_text_prompt = inference_state.get("text_prompts") is not None
+
+            (
+                obj_id_to_mask,
+                obj_id_to_score,
+                tracker_states_local_new,
+                tracker_metadata_new,
+                frame_stats,
+                _,
+            ) = self._det_track_one_frame(
+                frame_idx=frame_idx,
+                num_frames=num_frames_dynamic,
+                reverse=False,
+                input_batch=input_batch,
+                geometric_prompt=(
+                    inference_state["constants"]["empty_geometric_prompt"]
+                    if not has_geometric_prompt
+                    else inference_state["per_frame_geometric_prompt"][frame_idx]
+                ),
+                tracker_states_local=tracker_states_local,
+                tracker_metadata_prev=inference_state["tracker_metadata"],
+                feature_cache=inference_state["feature_cache"],
+                orig_vid_height=inference_state["orig_height"],
+                orig_vid_width=inference_state["orig_width"],
+                is_image_only=False,
+                allow_new_detections=has_text_prompt or has_geometric_prompt,
+            )
 
         inference_state["tracker_inference_states"] = tracker_states_local_new
         inference_state["tracker_metadata"] = tracker_metadata_new
         inference_state["previous_stages_out"][frame_idx] = "_THIS_FRAME_HAS_OUTPUTS_"
+
+        # Ensure category mapping exists (multi-cat path sets it above; single-cat path needs init)
+        if "obj_id_to_category" not in inference_state:
+            inference_state["obj_id_to_category"] = {}
+
+        # For single-category path: assign category to any new obj_ids not yet mapped
+        if text_prompts is not None and isinstance(text_prompts, list) and len(text_prompts) == 1:
+            cat_text = text_prompts[0]
+            for obj_id in obj_id_to_mask:
+                if int(obj_id) not in inference_state["obj_id_to_category"]:
+                    inference_state["obj_id_to_category"][int(obj_id)] = cat_text
 
         # Do not cache yet; caching happens after postprocess below (with suppression filtering)
 
@@ -407,6 +654,7 @@ class Sam3StreamInference(Sam3VideoBase):
             out_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(0, H_video, W_video, dtype=torch.bool)
             out_boxes_xywh = torch.zeros(0, 4, dtype=torch.float32)
+            out_obj_categories = []
         else:
             out_obj_ids = torch.tensor(curr_obj_ids, dtype=torch.int64)
             out_probs = torch.tensor([out["obj_id_to_score"][obj_id] for obj_id in curr_obj_ids])
@@ -462,14 +710,121 @@ class Sam3StreamInference(Sam3VideoBase):
                 ).squeeze(1)
             ) > 0
 
+        # Build category labels from persistent mapping
+        obj_id_to_category = inference_state.get("obj_id_to_category", {})
+        out_obj_categories = [
+            obj_id_to_category.get(int(oid), "unknown") for oid in curr_obj_ids
+        ]
+
         outputs = {
             "out_obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
+            "out_obj_categories": out_obj_categories,
             "frame_stats": out.get("frame_stats", None),
         }
         return outputs
+
+    def _cleanup_old_frame_data(
+        self,
+        inference_state: Dict[str, Any],
+        frame_idx: int,
+    ) -> None:
+        """Delete old frame data from all caches to free GPU/CPU memory.
+
+        This assumes you won't need to re-process or add prompts to prior frames
+        (i.e. old data beyond the retention window is no longer referenced).
+
+        Cleans up:
+          - ``feature_cache`` (backbone + tracker features per frame)
+          - ``cached_frame_outputs`` (final mask outputs per frame)
+          - ``previous_stages_out`` (output markers per frame)
+          - ``tracker_inference_states`` internal per-frame memory (maskmem)
+
+        The retention window is ``max_cached_frames`` (same as the output cache).
+        """
+        max_retain = self.max_cached_frames
+        if max_retain <= 0:
+            return  # unlimited retention
+
+        oldest_allowed_idx = frame_idx - max_retain
+
+        # 1) Prune feature_cache (backbone features per frame)
+        feature_cache = inference_state.get("feature_cache", {})
+        old_feat_keys = [
+            k for k in feature_cache.keys()
+            if isinstance(k, int) and k < oldest_allowed_idx
+        ]
+        for old_k in old_feat_keys:
+            feature_cache.pop(old_k, None)
+
+        # 2) Prune cached_frame_outputs (already partially done in _cache_frame_outputs,
+        #    but run again here for consistency after feature cleanup)
+        cached_outputs = inference_state.get("cached_frame_outputs", {})
+        old_out_keys = [
+            k for k in cached_outputs.keys()
+            if isinstance(k, int) and k < oldest_allowed_idx
+        ]
+        for old_k in old_out_keys:
+            cached_outputs.pop(old_k, None)
+
+        # 3) Clear old previous_stages_out markers (just placeholders, but clean anyway)
+        prev_stages = inference_state.get("previous_stages_out", [])
+        for t in range(len(prev_stages)):
+            if t < oldest_allowed_idx:
+                prev_stages[t] = None
+
+        # 4) Prune per-object mask memory from tracker inference states.
+        #    **Only prune ``non_cond_frame_outputs``** (automatically propagated
+        #    frames). ``cond_frame_outputs`` are anchor frames created from user
+        #    prompts and must be preserved — without them ``propagate_in_video``
+        #    has no starting point and raises "No points are provided".
+        for trk_state in inference_state.get("tracker_inference_states", []):
+            output_dict = trk_state.get("output_dict", {})
+            consolidated_frame_inds = trk_state.get("consolidated_frame_inds", {})
+            frames_already_tracked = trk_state.get("frames_already_tracked", {})
+
+            # -- non_cond_frame_outputs (safe to prune) --
+            ncf_storage = output_dict.get("non_cond_frame_outputs", {})
+            old_ncf_keys = [
+                k for k in ncf_storage.keys()
+                if isinstance(k, int) and k < oldest_allowed_idx
+            ]
+            for old_k in old_ncf_keys:
+                ncf_storage.pop(old_k, None)
+            if "non_cond_frame_outputs" in consolidated_frame_inds:
+                for old_k in old_ncf_keys:
+                    consolidated_frame_inds["non_cond_frame_outputs"].discard(old_k)
+
+            # Also clean per-object slices for non_cond only
+            output_dict_per_obj = trk_state.get("output_dict_per_obj", {})
+            for obj_output_dict in output_dict_per_obj.values():
+                ncf_storage_obj = obj_output_dict.get("non_cond_frame_outputs", {})
+                old_ncf_obj_keys = [
+                    k for k in ncf_storage_obj.keys()
+                    if isinstance(k, int) and k < oldest_allowed_idx
+                ]
+                for old_k in old_ncf_obj_keys:
+                    ncf_storage_obj.pop(old_k, None)
+
+            # Prune frames_already_tracked (dict of {frame_idx: {"reverse": bool}})
+            old_tracked_keys = [
+                k for k in frames_already_tracked.keys()
+                if isinstance(k, int) and k < oldest_allowed_idx
+            ]
+            for old_k in old_tracked_keys:
+                frames_already_tracked.pop(old_k, None)
+
+            # Prune temporary per-object outputs (non_cond only)
+            for obj_temp in trk_state.get("temp_output_dict_per_obj", {}).values():
+                storage = obj_temp.get("non_cond_frame_outputs", {})
+                old_keys = [
+                    k for k in storage.keys()
+                    if isinstance(k, int) and k < oldest_allowed_idx
+                ]
+                for old_k in old_keys:
+                    storage.pop(old_k, None)
 
     def _cache_frame_outputs(
         self,
@@ -491,6 +846,14 @@ class Sam3StreamInference(Sam3VideoBase):
         for k in list(filtered_obj_id_to_mask.keys()):
             if k in objects_to_exclude:
                 filtered_obj_id_to_mask.pop(k, None)
+
+        # Optionally offload mask tensors to CPU to save GPU VRAM
+        if inference_state.get("offload_state_to_cpu", False):
+            storage_device = inference_state["storage_device"]
+            for obj_id, mask in filtered_obj_id_to_mask.items():
+                if isinstance(mask, torch.Tensor) and mask.device != storage_device:
+                    filtered_obj_id_to_mask[obj_id] = mask.to(storage_device, non_blocking=True)
+
         inference_state["cached_frame_outputs"][frame_idx] = filtered_obj_id_to_mask
         # Prune cached frames if exceeding limit
         max_cached = self.max_cached_frames
@@ -502,6 +865,9 @@ class Sam3StreamInference(Sam3VideoBase):
                 to_remove = cached_keys[: len(cached_keys) - max_cached]
                 for old_k in to_remove:
                     inference_state["cached_frame_outputs"].pop(old_k, None)
+
+        # Clean up old frame data across all caches (features, tracker memory, etc.)
+        self._cleanup_old_frame_data(inference_state, frame_idx)
 
     def _build_tracker_output(self, inference_state, frame_idx, refined_obj_id_to_mask=None):
         assert (

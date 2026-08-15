@@ -13,7 +13,14 @@ from sam3.model_builder import build_sam3_stream_predictor
 from sam3.visualization_utils import render_masklet_frame
 
 YARP_IMAGE_PORT = "/sam3/rgbImage:i"
-DEFAULT_TEXT_PROMPT = "hand"
+DEFAULT_TEXT_PROMPT = ["sponge", "hand"]
+
+
+def is_inside_region(cx, cy, region):
+    """Check if normalized point (cx, cy) is inside region (x1, y1, x2, y2) all normalized."""
+    x1, y1, x2, y2 = region
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -27,7 +34,11 @@ if __name__ == "__main__":
         help="Name of the run's output directory and video file (without extension). "
         "If not specified, uses datetime.",
     )
-
+    parser.add_argument(
+        "--custom_det_chkpt",
+        type= str,
+        default="/data/dataset/sam3_train/coco_format/checkpoints/checkpoint.pt",
+    )
     parser.add_argument(
         "--output_root_dir",
         type=str,
@@ -37,11 +48,12 @@ if __name__ == "__main__":
 
     # === Input source options ===
     parser.add_argument(
-        "--text_prompt",
-        type=str,
-        default=DEFAULT_TEXT_PROMPT,
-        help=f"Text prompt for segmentation (default: '{DEFAULT_TEXT_PROMPT}')",
-    )
+    "--text_prompt",
+    type=str,
+    nargs="+",
+    default=DEFAULT_TEXT_PROMPT,
+    help=f"Text prompts for segmentation (default: {DEFAULT_TEXT_PROMPT})",
+)
     parser.add_argument(
         "--stream_type",
         type=str,
@@ -66,6 +78,17 @@ if __name__ == "__main__":
         type=str,
         default=YARP_IMAGE_PORT,
         help="YARP port name for --source=yarp",
+    )
+
+    # === Counting options ===
+    parser.add_argument(
+        "--counting_region",
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=("X1", "Y1", "X2", "Y2"),
+        help="Normalized rectangle region (x1 y1 x2 y2) for in/out counting, e.g. 0.1 0.1 0.9 0.9. "
+             "Objects crossing into this region count as 'in', leaving count as 'out'.",
     )
 
     # === Visualization options ===
@@ -125,6 +148,13 @@ if __name__ == "__main__":
         print(f"  {arg}: {value}")
     print(f"Starting realtime inference using text prompt: '{args.text_prompt}'")
 
+    # Counting state
+    counting_region = tuple(args.counting_region) if args.counting_region else None
+    prev_obj_inside = {}   # obj_id -> bool (inside region or not)
+    counts = {}            # category -> current live count inside region
+    if counting_region:
+        print(f"Counting region (normalized): {counting_region}")
+
     # Use datetime as video ID if run_output_name not specified
     if args.run_output_name is not None:
         video_id = args.run_output_name
@@ -147,6 +177,51 @@ if __name__ == "__main__":
     # Initialize predictor (single-GPU streaming)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     predictor = build_sam3_stream_predictor(device=device)
+    # predictor.model.recondition_every_nth_frame= 5
+    print("  Official model loaded.\n")
+    print("=" * 60)
+    print("Loading custom checkpoint ...")
+    custom_ckpt = torch.load(args.custom_det_chkpt, map_location="cpu", weights_only=True)
+
+    # The checkpoint may wrap the state_dict under a "model" key
+    if "model" in custom_ckpt and isinstance(custom_ckpt["model"], dict):
+        custom_ckpt = custom_ckpt["model"]
+
+    print(f"  Custom checkpoint has {len(custom_ckpt)} keys")
+    demo_model = predictor.model
+
+    detector_state = demo_model.detector.state_dict()
+    detector_keys = set(detector_state.keys())
+
+    remapped = {}
+    for k, v in custom_ckpt.items():
+        if k in detector_keys:
+            remapped[k] = v
+
+    print(f"  Matched {len(remapped)} / {len(detector_keys)} detector keys")
+
+    # Warn about keys that did NOT match
+    unmatched_custom = len(custom_ckpt) - len(remapped)
+    if unmatched_custom:
+        print(f"  ⚠ {unmatched_custom} custom checkpoint keys could not be matched "
+            f"(likely tracker-only or naming mismatch)")
+
+    # Load the custom detector weights
+    if remapped:
+        missing, unexpected = demo_model.detector.load_state_dict(
+            remapped, strict=False
+        )
+        if missing:
+            print(f"  ⚠ Detector missing keys: {len(missing)} "
+                f"(will keep official weights for these)")
+        if unexpected:
+            print(f"  ⚠ Detector unexpected keys: {len(unexpected)}")
+        print("  Custom detector weights applied.\n")
+    else:
+        print("  ❌ No detector keys matched! Using official detector weights.\n")
+
+    demo_model.cuda().eval()
+    print("Model ready (detector=custom, tracker=official).\n")
 
     resp = predictor.handle_request({"type": "start_session"})
     session_id = resp["session_id"]
@@ -221,8 +296,40 @@ if __name__ == "__main__":
                     overlay_rgb = render_masklet_frame(
                         frame_rgb, outputs, frame_idx=frame_idx, alpha=0.5
                     )
+
+                    # --- In/Out counting ---
+                    if counting_region and len(outputs.get("out_obj_ids", [])) > 0:
+                        boxes = outputs["out_boxes_xywh"]   # (cx, cy, w, h) normalized
+                        categories = outputs.get("out_obj_categories", ["unknown"] * len(boxes))
+                        for i, obj_id in enumerate(outputs["out_obj_ids"]):
+                            cx, cy = float(boxes[i][0]), float(boxes[i][1])
+                            inside = is_inside_region(cx, cy, counting_region)
+                            cat = categories[i] if i < len(categories) else "unknown"
+                            prev = prev_obj_inside.get(int(obj_id))
+                            if prev is False and inside:
+                                counts[cat] = counts.get(cat, 0) + 1
+                            elif prev is True and not inside:
+                                counts[cat] = counts.get(cat, 0) - 1
+                            prev_obj_inside[int(obj_id)] = inside
+
+                        # Print live counts
+                        count_str = " | ".join(
+                            f"{c}: {counts.get(c, 0)}" for c in sorted(counts.keys())
+                        )
+                        print(f"  [Inside] {count_str}", end="")
                 else:
                     overlay_rgb = frame_rgb
+
+                # Draw counting region
+                if counting_region:
+                    h, w = frame_rgb.shape[:2]
+                    x1, y1, x2, y2 = counting_region
+                    px1, py1 = int(x1 * w), int(y1 * h)
+                    px2, py2 = int(x2 * w), int(y2 * h)
+                    # cv2.rectangle expects BGR
+                    overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+                    cv2.rectangle(overlay_bgr, (px1, py1), (px2, py2), (0, 0, 255), 2)
+                    overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
 
                 # Save image per frame with 4-digit index
                 if args.save_images:
@@ -281,6 +388,14 @@ if __name__ == "__main__":
         # Close any OpenCV windows
         if args.viz_results:
             cv2.destroyAllWindows()
+
+        # Print final counting summary
+        if counting_region:
+            print(f"\n{'='*45}")
+            print(f"Live Count Summary (region: {counting_region}):")
+            for cat in sorted(counts.keys()):
+                print(f"  {cat}: inside={counts.get(cat, 0)}")
+            print(f"{'='*45}")
 
         print(f"Processed {frame_idx} frames.")
         print(f"Peak GPU memory usage: {peak_memory:.2f} GB.")
