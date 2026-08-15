@@ -1,4 +1,15 @@
-WORKDIR=/data/opervu/ws/sam3/sam3-realtime
-eval "$(conda shell.bash hook)"
-conda activate /home/opervu-user/miniconda3/envs/lang2segtrack
-cd "$WORKDIR" && PYTHONPATH=.:$PYTHONPATH python scripts/inference/video_stream.py --stream_type video --video_path /data/dataset/demo_video/output.mp4 --counting_region 0.35 0.35 0.85 0.85
+WORKDIR=/home/opervu/ws/sam3-realtime
+
+# Set USE_HDR=1 to use the Arena HDR camera; 0 to read a video file.
+USE_HDR=1
+
+VIDEO_PATH="$WORKDIR/assets/videos/bedroom.mp4"
+COUNTING_REGION="0.35 0.35 0.85 0.85"
+
+if [ "$USE_HDR" = "1" ]; then
+    STREAM_ARGS="--stream_type hdr"
+else
+    STREAM_ARGS="--stream_type video --video_path $VIDEO_PATH"
+fi
+
+cd "$WORKDIR" && pixi run python scripts/inference/video_stream.py $STREAM_ARGS --counting_region $COUNTING_REGION
